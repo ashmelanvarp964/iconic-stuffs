@@ -295,9 +295,13 @@ panel_lookup() { # uuid
   local r
   r=$(curl -fsS -m 20 -H "Authorization: Bearer $PANEL_KEY" -H "Accept: application/json" \
       "$PANEL_URL/api/application/servers?filter%5Buuid%5D=$1&include=user" 2>/dev/null) || return
-  PNAME[$1]=$(jq -r '.data[0].attributes.name // empty' <<< "$r")
-  PID_[$1]=$(jq -r '.data[0].attributes.id // empty' <<< "$r")
-  POWNER[$1]=$(jq -r '.data[0].attributes.relationships.user.attributes.email // empty' <<< "$r")
+
+  # Only continue if the response is valid JSON
+  echo "$r" | jq -e . >/dev/null 2>&1 || return
+
+  PNAME[$1]=$(jq -r '.data[0].attributes.name // empty' <<< "$r" 2>/dev/null)
+  PID_[$1]=$(jq -r '.data[0].attributes.id // empty' <<< "$r" 2>/dev/null)
+  POWNER[$1]=$(jq -r '.data[0].attributes.relationships.user.attributes.email // empty' <<< "$r" 2>/dev/null)
 }
  
 # ------------------------------------------------------------------ report ----
