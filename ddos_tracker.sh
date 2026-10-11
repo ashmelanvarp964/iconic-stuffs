@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-#  LUMACLOUD  •  ADVANCED DDoS & HIGH-LOAD DETECTOR v2.0
-#  Deep telemetry • Heuristic scoring • Live tools
+#  LUMACLOUD  •  ADVANCED DDoS & HIGH-LOAD DETECTOR v2.1
+#  Fixed division-by-zero + more robust parsing
 # ============================================================
 
 set -euo pipefail
@@ -18,7 +18,6 @@ GRAY='\033[0;90m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ── Logo ────────────────────────────────────────────────────
 print_logo() {
   clear
   echo -e "${CYAN}${BOLD}"
@@ -30,24 +29,19 @@ print_logo() {
  ███████╗╚██████╔╝██║ ╚═╝ ██║██║  ██║╚██████╗███████╗╚██████╔╝╚██████╔╝██████╔╝
  ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝ 
 EOF
-  echo -e "${PURPLE}     ⚡  ADVANCED DDoS • LOAD • TELEMETRY ENGINE  v2.0  ⚡${NC}"
+  echo -e "${PURPLE}     ⚡  ADVANCED DDoS • LOAD • TELEMETRY ENGINE  v2.1  ⚡${NC}"
   echo -e "${GRAY}              LumaCloud Security Scanner  •  Real-time Analysis${NC}"
   echo
 }
 
-# ── Boxes ───────────────────────────────────────────────────
 box_top() { echo -e "${CYAN}┌──────────────────────────────────────────────────────────────┐${NC}"; }
 box_bot() { echo -e "${CYAN}└──────────────────────────────────────────────────────────────┘${NC}"; }
-box_mid() { echo -e "${CYAN}├──────────────────────────────────────────────────────────────┤${NC}"; }
-box_line() { printf "${CYAN}│${NC} %-60s ${CYAN}│${NC}\n" "$1"; }
 
-# ── Dependencies ────────────────────────────────────────────
 check_and_offer_install() {
   local missing=()
   for cmd in ss iftop nload btop awk grep ip; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
-
   if ((${#missing[@]})); then
     echo -e "${YELLOW}[!] Missing tools: ${missing[*]}${NC}"
     read -rp "Auto-install missing packages? (y/N): " ans
@@ -63,75 +57,80 @@ check_and_offer_install() {
   fi
 }
 
-# ── Helpers ─────────────────────────────────────────────────
 get_default_iface() {
   ip route 2>/dev/null | awk '/default/ {print $5; exit}' || echo "eth0"
 }
 
 format_bytes() {
-  local b=$1
+  local b=${1:-0}
   if ((b >= 1073741824)); then awk -v b="$b" 'BEGIN{printf "%.2f GB/s", b/1073741824}'
   elif ((b >= 1048576)); then awk -v b="$b" 'BEGIN{printf "%.1f MB/s", b/1048576}'
   elif ((b >= 1024)); then awk -v b="$b" 'BEGIN{printf "%.1f KB/s", b/1024}'
   else echo "${b} B/s"; fi
 }
 
-# ── Deep stats collection ───────────────────────────────────
+safe_num() { echo "${1:-0}" | grep -E '^[0-9]+$' || echo 0; }
+
 collect_stats() {
   local iface
   iface=$(get_default_iface)
 
-  # Bandwidth sample (2s)
   local rx1 tx1 rx2 tx2
-  read -r _ rx1 _ _ _ _ _ _ _ tx1 _ < <(grep -w "$iface" /proc/net/dev | awk '{print $2,$10}')
+  read -r _ rx1 _ _ _ _ _ _ _ tx1 _ < <(grep -w "$iface" /proc/net/dev 2>/dev/null | awk '{print $2,$10}' || echo "0 0")
   sleep 2
-  read -r _ rx2 _ _ _ _ _ _ _ tx2 _ < <(grep -w "$iface" /proc/net/dev | awk '{print $2,$10}')
+  read -r _ rx2 _ _ _ _ _ _ _ tx2 _ < <(grep -w "$iface" /proc/net/dev 2>/dev/null | awk '{print $2,$10}' || echo "0 0")
+
+  rx1=$(safe_num "$rx1"); tx1=$(safe_num "$tx1")
+  rx2=$(safe_num "$rx2"); tx2=$(safe_num "$tx2")
   local rx_bps=$(( (rx2 - rx1) / 2 ))
   local tx_bps=$(( (tx2 - tx1) / 2 ))
+  ((rx_bps < 0)) && rx_bps=0
+  ((tx_bps < 0)) && tx_bps=0
 
-  # Connection stats
   local estab syn_recv time_wait close_wait unique_ips total_conn
   estab=$(ss -ant 2>/dev/null | grep -c ESTAB || echo 0)
   syn_recv=$(ss -ant 2>/dev/null | grep -c SYN-RECV || echo 0)
   time_wait=$(ss -ant 2>/dev/null | grep -c TIME-WAIT || echo 0)
   close_wait=$(ss -ant 2>/dev/null | grep -c CLOSE-WAIT || echo 0)
-  unique_ips=$(ss -tn 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | sort -u | wc -l)
-  total_conn=$(ss -ant 2>/dev/null | wc -l)
+  unique_ips=$(ss -tn 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | sort -u | wc -l || echo 0)
+  total_conn=$(ss -ant 2>/dev/null | wc -l || echo 0)
 
-  # Load
+  estab=$(safe_num "$estab")
+  syn_recv=$(safe_num "$syn_recv")
+  time_wait=$(safe_num "$time_wait")
+  close_wait=$(safe_num "$close_wait")
+  unique_ips=$(safe_num "$unique_ips")
+  total_conn=$(safe_num "$total_conn")
+
   local load1 load5 cpus
-  read -r load1 load5 _ < /proc/loadavg
-  cpus=$(nproc)
-
-  # TCP kernel stats (syn cookies, drops, etc.)
-  local tcp_stats
-  tcp_stats=$(awk '/Tcp:/ {print}' /proc/net/snmp 2>/dev/null | tail -1)
+  read -r load1 load5 _ < /proc/loadavg 2>/dev/null || load1=0
+  cpus=$(nproc 2>/dev/null || echo 1)
+  cpus=$(safe_num "$cpus")
+  ((cpus == 0)) && cpus=1
 
   echo "$iface|$rx_bps|$tx_bps|$estab|$syn_recv|$time_wait|$close_wait|$unique_ips|$total_conn|$load1|$cpus"
 }
 
-# ── Top source IPs ──────────────────────────────────────────
 top_source_ips() {
   echo -e "\n${CYAN}${BOLD}TOP SOURCE IPs (by connection count)${NC}"
   ss -tn 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -15 | \
   while read -r count ip; do
+    count=$(safe_num "$count")
     local color="$GREEN"
     ((count > 100)) && color="$YELLOW"
     ((count > 500)) && color="$RED"
     printf "  ${color}%-8s${NC} %s\n" "$count" "$ip"
-  done
+  done || echo -e "  ${GRAY}No data${NC}"
 }
 
-# ── Port under attack ───────────────────────────────────────
 top_dest_ports() {
   echo -e "\n${CYAN}${BOLD}TOP DESTINATION PORTS${NC}"
   ss -tn 2>/dev/null | awk 'NR>1 {print $4}' | cut -d: -f2 | sort | uniq -c | sort -nr | head -10 | \
   while read -r count port; do
     printf "  ${YELLOW}%-6s${NC} connections → port %s\n" "$count" "$port"
-  done
+  done || echo -e "  ${GRAY}No data${NC}"
 }
 
-# ── Advanced scoring ────────────────────────────────────────
 analyze() {
   local data
   data=$(collect_stats)
@@ -141,7 +140,6 @@ analyze() {
   local reasons=()
   local severity="LOW"
 
-  # Connection thresholds
   ((estab > 15000)) && { reasons+=("CRITICAL: Extremely high ESTABLISHED ($estab)"); score=$((score+5)); }
   ((estab > 8000))  && { reasons+=("Very high ESTABLISHED connections ($estab)"); score=$((score+3)); }
   ((estab > 4000))  && { reasons+=("Elevated ESTABLISHED ($estab)"); score=$((score+1)); }
@@ -153,28 +151,25 @@ analyze() {
   ((unique_ips > 5000)) && { reasons+=("Very high unique remote IPs: $unique_ips"); score=$((score+4)); }
   ((unique_ips > 2000)) && { reasons+=("High unique IPs: $unique_ips"); score=$((score+2)); }
 
-  # Bandwidth
   ((rx_bps > 200000000)) && { reasons+=("CRITICAL inbound bandwidth"); score=$((score+5)); }
   ((rx_bps > 80000000))  && { reasons+=("Very high inbound traffic"); score=$((score+3)); }
   ((rx_bps > 30000000))  && { reasons+=("Elevated inbound traffic"); score=$((score+1)); }
 
-  # Load vs cores
-  local load_ratio
-  load_ratio=$(awk -v l="$load1" -v c="$cpus" 'BEGIN{printf "%.2f", l/c}')
-  awk -v r="$load_ratio" 'BEGIN{exit !(r > 2.0)}' && { reasons+=("System overloaded (load/core = $load_ratio)"); score=$((score+2)); }
-
-  # Verdict
-  if ((score >= 10)); then
-    severity="CRITICAL"
-  elif ((score >= 6)); then
-    severity="HIGH"
-  elif ((score >= 3)); then
-    severity="MEDIUM"
-  else
-    severity="LOW"
+  # Safe load ratio
+  local load_ratio="0.00"
+  if ((cpus > 0)); then
+    load_ratio=$(awk -v l="$load1" -v c="$cpus" 'BEGIN{printf "%.2f", (l+0)/(c+0)}' 2>/dev/null || echo "0.00")
   fi
+  awk -v r="$load_ratio" 'BEGIN{exit !(r+0 > 2.0)}' 2>/dev/null && {
+    reasons+=("System overloaded (load/core = $load_ratio)")
+    score=$((score+2))
+  }
 
-  # Display
+  if ((score >= 10)); then severity="CRITICAL"
+  elif ((score >= 6)); then severity="HIGH"
+  elif ((score >= 3)); then severity="MEDIUM"
+  else severity="LOW"; fi
+
   echo -e "\n${BOLD}${CYAN}┌─ DEEP ANALYSIS RESULT ───────────────────────────────────┐${NC}"
   case "$severity" in
     CRITICAL) echo -e "${RED}│  🚨  CRITICAL — Strong DDoS / Attack indicators          │${NC}" ;;
@@ -183,13 +178,11 @@ analyze() {
     *)        echo -e "${GREEN}│  ✓   LOW — No significant DDoS indicators               │${NC}" ;;
   esac
   echo -e "${CYAN}└──────────────────────────────────────────────────────────┘${NC}"
-  echo -e "${GRAY}Score: $score / 25+   |   Severity: $severity${NC}"
+  echo -e "${GRAY}Score: $score   |   Severity: $severity${NC}"
 
   if ((${#reasons[@]})); then
     echo -e "\n${YELLOW}${BOLD}Detected Indicators:${NC}"
-    for r in "${reasons[@]}"; do
-      echo -e "  ${RED}•${NC} $r"
-    done
+    for r in "${reasons[@]}"; do echo -e "  ${RED}•${NC} $r"; done
   fi
 
   echo -e "\n${CYAN}${BOLD}Current Telemetry${NC}"
@@ -206,7 +199,6 @@ analyze() {
   top_dest_ports
 }
 
-# ── Mitigation tips ─────────────────────────────────────────
 show_mitigation() {
   echo -e "\n${PURPLE}${BOLD}Quick Mitigation Suggestions${NC}"
   echo -e "${GRAY}──────────────────────────────────────────────────────────────${NC}"
@@ -218,7 +210,6 @@ show_mitigation() {
   echo
 }
 
-# ── Menu ────────────────────────────────────────────────────
 show_menu() {
   echo -e "\n${CYAN}${BOLD}Actions:${NC}"
   echo -e "  ${GREEN}[1]${NC} Full Deep Scan"
@@ -250,16 +241,14 @@ count_states_pretty() {
     [[ "$s" =~ SYN|TIME|CLOSE ]] && col="$YELLOW"
     ((c > 2000)) && col="$RED"
     printf "  ${col}%-12s${NC} %6s\n" "$s" "$c"
-  done
+  done || true
 }
 
-# ── Main ────────────────────────────────────────────────────
 main() {
   print_logo
   check_and_offer_install
   analyze
   show_mitigation
-
   while true; do
     show_menu
   done
