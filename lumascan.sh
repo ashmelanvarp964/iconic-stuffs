@@ -14,7 +14,7 @@
 # ============================================================================
  
 VERSION="1.0.0"
-AUTHOR="LumaCloud Studios"
+AUTHOR="LumaCloud Studios By Ashmel"
 VOL_ROOT="${LUMA_VOLUMES:-/var/lib/pterodactyl/volumes}"
 CPU_LIMIT="${LUMA_CPU:-85}"
 CONF_FILE="/etc/lumacloud.conf"
