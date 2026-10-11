@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
-#  LUMACLOUD  •  ADVANCED DDoS & HIGH-LOAD DETECTOR v2.1
-#  Fixed division-by-zero + more robust parsing
+#  LUMACLOUD  •  ADVANCED DDoS & HIGH-LOAD DETECTOR v2.2
+#  Fixed menu reliability + better error handling
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail   # removed -e so menu doesn't die on missing tools
 
 # ── Colors ──────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -29,13 +29,10 @@ print_logo() {
  ███████╗╚██████╔╝██║ ╚═╝ ██║██║  ██║╚██████╗███████╗╚██████╔╝╚██████╔╝██████╔╝
  ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝ ╚═════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝ 
 EOF
-  echo -e "${PURPLE}     ⚡  ADVANCED DDoS • LOAD • TELEMETRY ENGINE  v2.1  ⚡${NC}"
+  echo -e "${PURPLE}     ⚡  ADVANCED DDoS • LOAD • TELEMETRY ENGINE  v2.2  ⚡${NC}"
   echo -e "${GRAY}              LumaCloud Security Scanner  •  Real-time Analysis${NC}"
   echo
 }
-
-box_top() { echo -e "${CYAN}┌──────────────────────────────────────────────────────────────┐${NC}"; }
-box_bot() { echo -e "${CYAN}└──────────────────────────────────────────────────────────────┘${NC}"; }
 
 check_and_offer_install() {
   local missing=()
@@ -87,28 +84,26 @@ collect_stats() {
   ((rx_bps < 0)) && rx_bps=0
   ((tx_bps < 0)) && tx_bps=0
 
-  local estab syn_recv time_wait close_wait unique_ips total_conn
+  local estab syn_recv time_wait close_wait unique_ips
   estab=$(ss -ant 2>/dev/null | grep -c ESTAB || echo 0)
   syn_recv=$(ss -ant 2>/dev/null | grep -c SYN-RECV || echo 0)
   time_wait=$(ss -ant 2>/dev/null | grep -c TIME-WAIT || echo 0)
   close_wait=$(ss -ant 2>/dev/null | grep -c CLOSE-WAIT || echo 0)
   unique_ips=$(ss -tn 2>/dev/null | awk 'NR>1 {print $5}' | cut -d: -f1 | sort -u | wc -l || echo 0)
-  total_conn=$(ss -ant 2>/dev/null | wc -l || echo 0)
 
   estab=$(safe_num "$estab")
   syn_recv=$(safe_num "$syn_recv")
   time_wait=$(safe_num "$time_wait")
   close_wait=$(safe_num "$close_wait")
   unique_ips=$(safe_num "$unique_ips")
-  total_conn=$(safe_num "$total_conn")
 
-  local load1 load5 cpus
-  read -r load1 load5 _ < /proc/loadavg 2>/dev/null || load1=0
+  local load1 cpus
+  read -r load1 _ _ < /proc/loadavg 2>/dev/null || load1=0
   cpus=$(nproc 2>/dev/null || echo 1)
   cpus=$(safe_num "$cpus")
   ((cpus == 0)) && cpus=1
 
-  echo "$iface|$rx_bps|$tx_bps|$estab|$syn_recv|$time_wait|$close_wait|$unique_ips|$total_conn|$load1|$cpus"
+  echo "$iface|$rx_bps|$tx_bps|$estab|$syn_recv|$time_wait|$close_wait|$unique_ips|$load1|$cpus"
 }
 
 top_source_ips() {
@@ -134,7 +129,7 @@ top_dest_ports() {
 analyze() {
   local data
   data=$(collect_stats)
-  IFS='|' read -r iface rx_bps tx_bps estab syn_recv time_wait close_wait unique_ips total_conn load1 cpus <<< "$data"
+  IFS='|' read -r iface rx_bps tx_bps estab syn_recv time_wait close_wait unique_ips load1 cpus <<< "$data"
 
   local score=0
   local reasons=()
@@ -155,7 +150,6 @@ analyze() {
   ((rx_bps > 80000000))  && { reasons+=("Very high inbound traffic"); score=$((score+3)); }
   ((rx_bps > 30000000))  && { reasons+=("Elevated inbound traffic"); score=$((score+1)); }
 
-  # Safe load ratio
   local load_ratio="0.00"
   if ((cpus > 0)); then
     load_ratio=$(awk -v l="$load1" -v c="$cpus" 'BEGIN{printf "%.2f", (l+0)/(c+0)}' 2>/dev/null || echo "0.00")
@@ -163,7 +157,7 @@ analyze() {
   awk -v r="$load_ratio" 'BEGIN{exit !(r+0 > 2.0)}' 2>/dev/null && {
     reasons+=("System overloaded (load/core = $load_ratio)")
     score=$((score+2))
-  }
+  } || true
 
   if ((score >= 10)); then severity="CRITICAL"
   elif ((score >= 6)); then severity="HIGH"
@@ -210,6 +204,19 @@ show_mitigation() {
   echo
 }
 
+run_tool() {
+  local tool="$1"
+  if command -v "$tool" >/dev/null 2>&1; then
+    echo -e "${GREEN}Launching $tool... (exit to return to menu)${NC}"
+    sleep 1
+    "$tool" || echo -e "${YELLOW}$tool exited with error${NC}"
+  else
+    echo -e "${RED}$tool is not installed.${NC}"
+    echo -e "${GRAY}Install with: apt install $tool${NC}"
+    read -rp "Press Enter to continue..."
+  fi
+}
+
 show_menu() {
   echo -e "\n${CYAN}${BOLD}Actions:${NC}"
   echo -e "  ${GREEN}[1]${NC} Full Deep Scan"
@@ -222,14 +229,14 @@ show_menu() {
   echo
   read -rp "Select: " choice
   case "$choice" in
-    1) analyze ;;
-    2) nload ;;
-    3) iftop ;;
-    4) btop ;;
+    1) print_logo; analyze; show_mitigation ;;
+    2) run_tool nload ;;
+    3) run_tool iftop ;;
+    4) run_tool btop ;;
     5) show_mitigation; read -rp "Press Enter..." ;;
-    6) ss -s; echo; count_states_pretty; read -rp "Press Enter..." ;;
-    0) exit 0 ;;
-    *) echo "Invalid option"; sleep 1 ;;
+    6) echo; ss -s 2>/dev/null || echo "ss failed"; echo; count_states_pretty; read -rp "Press Enter..." ;;
+    0|q|Q) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
+    *) echo -e "${RED}Invalid option${NC}"; sleep 1 ;;
   esac
 }
 
