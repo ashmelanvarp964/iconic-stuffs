@@ -32,14 +32,14 @@ CYN=$'\e[38;5;87m'; PUR=$'\e[38;5;141m'; PNK=$'\e[38;5;211m'
 GRY=$'\e[38;5;245m'; WHT=$'\e[38;5;255m'; TEAL=$'\e[38;5;43m'; ORG=$'\e[38;5;209m'
  
 # -------------------------------------------------------------- signatures ----
-BACKDOOR_RE='backdoor|b4ckd00r|forceop|force-op|hackerman|reverse.?shell|/dev/tcp/|bash -i >&|nc -e |skidded.?by'
-NULLED_RE='nulled|blackspigot|leakforums|cracked.?by|%%__USER__%%|%%__RESOURCE__%%|%%__NONCE__%%|leaked.?by|mc-market-leak'
+BACKDOOR_RE='/dev/tcp/|bash -i >&|nc -e /bin|reverse.?shell|b4ckd00r|hackerman'
+NULLED_RE='nulled by|nulled\.to|nulledbb|nulledmc|nulled-?forums|cracked by|crackedby|leaked by|leakedby|blackspigot|leakforums|mc-market-leak'
 MINER_CONTENT_RE='stratum\+(tcp|ssl)://|pool\.(supportxmr|minexmr|hashvault|nanopool)|xmrig|cryptonight|randomx'
 DDOS_CONTENT_RE='udp.?flood|syn.?flood|slowloris|http.?flood|hping3|ddos.?attack'
 PROC_RE='xmrig|minerd|cpuminer|kinsing|kdevtmpfsi|nbminer|t-rex|ethminer|lolminer|stratum\+|hping3|slowloris|masscan|zmap|mhddos|udpflood'
 MINER_NAME_ARGS=( -iname 'xmrig*' -o -iname 'minerd*' -o -iname 'cpuminer*' -o -iname 'kinsing*' -o -iname 'kdevtmpfsi*' -o -iname 'nbminer*' -o -iname 't-rex*' -o -iname 'ethminer*' -o -iname 'lolminer*' -o -iname 'phoenixminer*' )
 DDOS_NAME_ARGS=( -iname 'hping*' -o -iname 'slowloris*' -o -iname 'loic*' -o -iname 'goldeneye*' -o -iname 'mhddos*' -o -iname 'udpflood*' -o -iname 'synflood*' )
-PRUNE_ARGS=( '(' -type d '(' -name 'world*' -o -name logs -o -name libraries -o -name cache -o -name node_modules -o -name backups -o -name versions -o -name .git ')' -prune ')' -o )
+PRUNE_ARGS=( '(' -type d '(' -name 'world*' -o -name logs -o -name libraries -o -name cache -o -name node_modules -o -name backups -o -name versions -o -name .git -o -name '.paper-remapped' -o -name 'paper-remapped' ')' -prune ')' -o )
  
 # ----------------------------------------------------------------- temp/cleanup ----
 TMP=$(mktemp -d /tmp/lumacloud.XXXXXX)
@@ -143,14 +143,15 @@ srv_label() { # uuid cid
 }
  
 # ------------------------------------------------------- findings storage ----
-declare -A SCORE DETAIL PATHS PNAME POWNER PID_
+declare -A SCORE DETAIL PATHS PNAME POWNER PID_ TYPECNT
 TOTAL=0
 declare -A W=( [BACKDOOR]=10 [MINER]=10 [MINER-PROC]=10 [DDOS]=8 [DDOS-PROC]=8 [NULLED]=3 [CORRUPT]=1 [HIGH-CPU]=2 )
  
 uuid_of_path() { local p="${1#$VOL_ROOT/}"; echo "${p%%/*}"; }
 add_finding() { # uuid type path evidence
   local u="$1" t="$2" p="$3" e="$4"
-  SCORE[$u]=$(( ${SCORE[$u]:-0} + ${W[$t]:-1} ))
+  TYPECNT[$u|$t]=$(( ${TYPECNT[$u|$t]:-0} + 1 ))
+  [ "${TYPECNT[$u|$t]}" -le 3 ] && SCORE[$u]=$(( ${SCORE[$u]:-0} + ${W[$t]:-1} )) || SCORE[$u]=${SCORE[$u]:-0}
   DETAIL[$u]+="${t}|${p}|${e}"$'\n'
   [ -n "$p" ] && PATHS[$u]+="${p}"$'\n'
   TOTAL=$((TOTAL+1))
@@ -159,9 +160,20 @@ add_finding() { # uuid type path evidence
 # ------------------------------------------------------ parallel jar workers ----
 jar_ok_size() { [ "$(stat -c %s "$1" 2>/dev/null || echo 0)" -le 104857600 ]; }
 evidence()    { head -n1 | head -c 40 | tr -cd '[:print:]'; }
-chk_backdoor() { jar_ok_size "$1" && unzip -p "$1" 2>/dev/null | grep -aEiom1 "$BACKDOOR_RE" | evidence; }
+chk_backdoor() {
+  jar_ok_size "$1" || return
+  local m; m=$(unzip -Z1 "$1" 2>/dev/null | grep -aEi -m1 '(^|/)(backdoor|b4ckd00r|hackerman)[^/]*\.class$' | evidence)
+  if [ -n "$m" ]; then echo "class: $m"; return; fi
+  unzip -p "$1" 2>/dev/null | grep -aEiom1 "$BACKDOOR_RE" | evidence
+}
 chk_nulled()   { jar_ok_size "$1" && unzip -p "$1" 2>/dev/null | grep -aEiom1 "$NULLED_RE"   | evidence; }
-chk_corrupt()  { if [ ! -s "$1" ]; then echo "empty file"; elif ! unzip -tqq "$1" >/dev/null 2>&1; then echo "jar integrity test failed"; fi; }
+chk_corrupt()  {
+  if [ ! -s "$1" ]; then echo "empty file"; return; fi
+  unzip -tqq "$1" >/dev/null 2>&1; local rc=$?
+  [ "$rc" -lt 2 ] && return                      # 0 = ok, 1 = harmless warnings
+  if command -v python3 >/dev/null 2>&1 && python3 -c 'import zipfile,sys; sys.exit(1 if zipfile.ZipFile(sys.argv[1]).testzip() else 0)' "$1" 2>/dev/null; then return; fi
+  echo "bad zip structure"
+}
 worker() { # mode files...
   local mode="$1" f m t; shift
   for f in "$@"; do
@@ -321,8 +333,15 @@ print_report() {
     [ -n "$lbl" ] && box_row "${GRY}MOTD :${R} ${lbl:0:60}"
     [ -n "${PNAME[$u]:-}" ] && box_row "${GRY}Panel:${R} ${PNAME[$u]:0:28}  ${GRY}Owner:${R} ${B}${POWNER[$u]:-?}${R}"
     box_sep
+    declare -A SHOWN=(); declare -A TCOUNT=()
+    while IFS='|' read -r type p e; do [ -n "$type" ] && TCOUNT[$type]=$(( ${TCOUNT[$type]:-0} + 1 )); done <<< "${DETAIL[$u]}"
     while IFS='|' read -r type p e; do
       [ -z "$type" ] && continue
+      SHOWN[$type]=$(( ${SHOWN[$type]:-0} + 1 ))
+      if [ "${SHOWN[$type]}" -gt 5 ]; then
+        [ "${SHOWN[$type]}" -eq 6 ] && box_row "$(type_color "$type")[$(printf '%-10s' "$type")]${R} ${GRY}… +$(( ${TCOUNT[$type]} - 5 )) more (see saved report)${R}"
+        continue
+      fi
       printf -v tag '%-10s' "$type"
       if [ -n "$p" ]; then rel=${p#$VOL_ROOT/*/}; box_row "$(type_color "$type")[${tag}]${R} $(trunc "$rel" 32) ${GRY}(${e:0:22})${R}"
       else box_row "$(type_color "$type")[${tag}]${R} ${GRY}${e:0:56}${R}"; fi
