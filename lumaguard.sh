@@ -22,11 +22,11 @@
 #          LUMA_DRYRUN=1      print firewall commands instead of running them
 # ============================================================================
  
-VERSION="1.0.0"
+VERSION="1.0.3"
 AUTHOR="LumaCloud Studios"
 SECS="${LUMA_SECS:-8}"; TOPN="${LUMA_TOP:-12}"
 PPS_BASE="${LUMA_PPS_BASE:-15000}"
-IP_PPS="${LUMA_IP_PPS:-500}"; IP_SYN="${LUMA_IP_SYN:-40}"; IP_CONNS="${LUMA_IP_CONNS:-100}"; IP_SYNRECV="${LUMA_IP_SYNRECV:-20}"
+IP_PPS="${LUMA_IP_PPS:-500}"; IP_SYN="${LUMA_IP_SYN:-30}"; IP_CONNS="${LUMA_IP_CONNS:-100}"; IP_SYNRECV="${LUMA_IP_SYNRECV:-20}"
 BLOCK_TTL="${LUMA_BLOCK_TTL:-21600}"
 RL_SYN="${LUMA_RL_SYN:-60}"; RL_UDP="${LUMA_RL_UDP:-3000}"; RL_ICMP="${LUMA_RL_ICMP:-20}"
 VOL_ROOT="${LUMA_VOLUMES:-/var/lib/pterodactyl/volumes}"
@@ -88,6 +88,7 @@ banner() {
   if [ "$COLS" -ge 80 ]; then
     local i; for i in 0 1 2 3 4 5; do printf ' \e[1;38;5;%sm%s\e[0m\n' "${LOGO_COLS[$i]}" "${LOGO[$i]}"; done
   else printf '  \e[1;38;5;51mL\e[38;5;45mU\e[38;5;39mM\e[38;5;75mA\e[38;5;141mC\e[38;5;177mL\e[38;5;141mO\e[38;5;99mU\e[38;5;93mD\e[0m\n'; fi
+  [ "$COLS" -lt 80 ] && printf '  %s(tip: widen the terminal to 80+ columns for the correct layout)%s\n' "$GRY" "$R"
   echo
   center "${YLW}⚡${R} ${CYN}${B}NEXT-GEN CLOUD INFRASTRUCTURE${R} ${GRY}•${R} ${PUR}DDOS SHIELD${R}"
   center "${GRY}Made with Love ♥ & Brain 🧠 by ${R}${B}${WHT}${AUTHOR}${R}"
@@ -131,6 +132,7 @@ detect_env() {
   LOCAL_IP=$(ip -o route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
   LINK_MBPS=$(cat "/sys/class/net/$IFACE/speed" 2>/dev/null); { [[ "$LINK_MBPS" =~ ^[0-9]+$ ]] && [ "$LINK_MBPS" -gt 0 ]; } || LINK_MBPS="${LUMA_LINK:-1000}"
   command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1 && HAVE_DOCKER=1
+  QOPT=""; tcpdump --help 2>&1 | grep -q -- '-Q' && QOPT="-Q in"
 }
  
 declare -A WL
@@ -138,6 +140,9 @@ build_whitelist() { # admin SSH peers, panel host, own IPs, env
   local ip host
   for ip in $LUMA_WHITELIST $(hostname -I 2>/dev/null) $LOCAL_IP; do WL[$ip]=1; done
   while read -r ip; do [ -n "$ip" ] && WL[$ip]=1; done < <(ss -Htn state established '( sport = :22 )' 2>/dev/null | awk "$PEER_AWK")
+  # DNS resolvers: in a reflection attack these show up as "attackers" — blocking them would break the node's own DNS
+  for ip in 8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220 \
+            $(awk '/^nameserver/{print $2}' /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null); do WL[$ip]=1; done
   if [ -r /etc/pterodactyl/config.yml ]; then
     host=$(awk -F'[/:]+' '/^remote:/{print $3; exit}' /etc/pterodactyl/config.yml 2>/dev/null)
     [ -n "$host" ] && for ip in $(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u); do WL[$ip]=1; done
@@ -172,27 +177,30 @@ geo_row() { local g="${GEO[$1]:-}"; [ -z "$g" ] && g="--|Unknown|-|-|-|false|fal
  
 # ------------------------------------------------------------------ sampling ----
 net_sample() { sed 's/:/ /' /proc/net/dev | awk -v i="$IFACE" '$1==i {print $2,$3,$10,$11}'; }
-netio_snapshot() { docker stats --no-stream --format '{{.Name}}|{{.NetIO}}' 2>/dev/null | awk -F'|' '
-  function tob(s,  n,u){ match(s,/[0-9.]+/); n=substr(s,RSTART,RLENGTH)+0; u=substr(s,RSTART+RLENGTH); gsub(/ /,"",u)
-    if(u=="kB"||u=="KB")n*=1000; else if(u=="MB")n*=1e6; else if(u=="GB")n*=1e9; else if(u=="TB")n*=1e12
-    else if(u=="KiB")n*=1024; else if(u=="MiB")n*=1048576; else if(u=="GiB")n*=1073741824; return n }
-  { split($2,x," / "); print $1, tob(x[1]) }'; }
- 
 read -r -d '' CAP_AWK <<'EOF'
+function addr(a,   n,arr) {
+  PORT=""
+  if (index(a,":")==0) {
+    n=split(a,arr,".")
+    if (n==5) { PORT=arr[5]; return arr[1] "." arr[2] "." arr[3] "." arr[4] }
+    return a
+  }
+  if (match(a, /\.[0-9]+$/)) {
+    if (index(substr(a,1,RSTART-1),".")==0) { PORT=substr(a,RSTART+1); return substr(a,1,RSTART-1) }
+  }
+  return a
+}
 {
   if ($2!="IP" && $2!="IP6") next
-  src=$3; dst=$5; sub(/:$/,"",dst); proto="other"
-  if ($0 ~ /Flags \[/) proto="tcp"; else if ($0 ~ / UDP,/) proto="udp"; else if ($0 ~ /ICMP/) proto="icmp"
-  sp=""; dp=""
-  if (proto=="tcp" || proto=="udp") {
-    n=split(src,a,"."); sp=a[n]; sub("\\." sp "$","",src)
-    m=split(dst,b,"."); dp=b[m]; sub("\\." dp "$","",dst)
-  }
+  dst=$5; dst=substr(dst,1,length(dst)-1)
+  p6=$6
+  if (p6=="Flags") proto="tcp"; else if (p6=="UDP,") proto="udp"; else if (substr(p6,1,4)=="ICMP") proto="icmp"; else proto="other"
+  src=addr($3); sp=PORT; dst=addr(dst); dp=PORT
   tot++; P[proto]++; S[src]++; DI[dst]++
-  if (proto=="tcp" && $0 ~ /Flags \[S\],/) { SYN[src]++; synt++ }
-  if (proto=="udp") { U[src]++; UP[sp]++ }
-  if (proto=="icmp") IC[src]++
-  if (dp!="") D[dp " " proto]++
+  if (proto=="tcp") { if ($7=="[S],") { SYN[src]++; synt++ } }
+  else if (proto=="udp") { U[src]++; UP[sp]++ }
+  else if (proto=="icmp") IC[src]++
+  if (dp!="" && (proto=="tcp" || proto=="udp")) D[dp " " proto]++
 }
 END {
   f=out "/cap_src";   for (k in S)  printf "%s %d %d %d %d\n", k, S[k], SYN[k]+0, U[k]+0, IC[k]+0 > f; close(f)
@@ -205,24 +213,30 @@ EOF
  
 capture_job() {
   : > "$TMP/cap_src"; : > "$TMP/cap_dst"; : > "$TMP/cap_dstip"; : > "$TMP/cap_udpsp"; echo "0 0 0 0 0 0" > "$TMP/cap_tot"
-  net_sample > "$TMP/net0"; local t0 t1 i0 i1
-  if [ "$HAVE_DOCKER" -eq 1 ]; then netio_snapshot > "$TMP/io0"; fi; i0=$(date +%s.%N); t0=$i0
+  net_sample > "$TMP/net0"; local t0 t1; t0=$(date +%s.%N)
   if [ -n "${LUMA_FAKE_CAPTURE:-}" ]; then cat "$LUMA_FAKE_CAPTURE"; sleep 1
-  else timeout "$SECS" tcpdump -nn -l -Q in -i "$IFACE" -c 500000 'not port 22' 2>/dev/null; fi | awk -v out="$TMP" "$CAP_AWK"
+  else timeout "$SECS" tcpdump -nn -l $QOPT -i "$IFACE" -c 500000 'not port 22' 2>/dev/null; fi | awk -v out="$TMP" "$CAP_AWK"
   t1=$(date +%s.%N); net_sample > "$TMP/net1"
   awk -v a="$t0" -v b="$t1" 'BEGIN{d=b-a; if(d<0.5)d=0.5; printf "%.2f\n", d}' > "$TMP/elapsed"
   # connection table
   ss -Htan 2>/dev/null | awk '{c[$1]++} END{for(k in c) print k, c[k]}' > "$TMP/ss_states"
   ss -Htn state established 2>/dev/null | awk "$PEER_AWK" | sort | uniq -c | awk '{print $2, $1}' > "$TMP/conn_est"
   ss -Htn state syn-recv 2>/dev/null | awk "$PEER_AWK" | sort | uniq -c | awk '{print $2, $1}' > "$TMP/conn_syn"
-  if [ "$HAVE_DOCKER" -eq 1 ]; then netio_snapshot > "$TMP/io1"; i1=$(date +%s.%N)
-    awk -v a="$i0" -v b="$i1" 'BEGIN{d=b-a; if(d<0.5)d=0.5; printf "%.2f\n", d}' > "$TMP/io_elapsed"; fi
 }
  
 # ------------------------------------------------------------------ analysis ----
 declare -A ATT_PPS ATT_SYN ATT_CONN ATT_SR ATT_SUS
 ATT_ORDER=(); SUSPECTS=()
 LEVEL=0; SCORE=0; REASONS=(); ATTACK_TYPES=()
+load_ranked() { # file: sus score ip pps syn conn synrecv
+  ATT_ORDER=(); SUSPECTS=(); ATT_PPS=(); ATT_SYN=(); ATT_CONN=(); ATT_SR=(); ATT_SUS=()
+  local sus sc ip pps syn cn sr
+  while read -r sus sc ip pps syn cn sr; do
+    [ -z "$ip" ] && continue; is_protected "$ip" && continue
+    ATT_ORDER+=("$ip"); ATT_PPS[$ip]=$pps; ATT_SYN[$ip]=$syn; ATT_CONN[$ip]=$cn; ATT_SR[$ip]=$sr; ATT_SUS[$ip]=$sus
+    [ "$sus" -eq 1 ] && SUSPECTS+=("$ip")
+  done < "$1"
+}
 amp_name() { case "$1" in 53) echo DNS;; 123) echo NTP;; 11211) echo Memcached;; 1900) echo SSDP;; 161) echo SNMP;; 389) echo CLDAP;; 19) echo CHARGEN;; 111) echo Portmap;; 137) echo NetBIOS;; 3702) echo WS-Discovery;; 5353) echo mDNS;; *) echo "$1";; esac; }
  
 analyze() {
@@ -239,6 +253,7 @@ analyze() {
   local t=$CAP_TOT; [ "$t" -eq 0 ] && t=1
   TCP_SH=$((CAP_TCP*100/t)); UDP_SH=$((CAP_UDP*100/t)); ICMP_SH=$((CAP_ICMP*100/t)); SYN_SH=$((CAP_SYN*100/t))
   CAP_PPS=$(( CAP_TOT / ${ELAP%.*} )); [ "${ELAP%.*}" -eq 0 ] && CAP_PPS=$CAP_TOT
+  [ "$CAP_PPS" -gt "$RX_PPS" ] && RX_PPS=$CAP_PPS
   SYNRECV=$(awk '$1=="SYN-RECV"{print $2}' "$TMP/ss_states"); SYNRECV=${SYNRECV:-0}
   ESTAB=$(awk '$1=="ESTAB"{print $2}' "$TMP/ss_states"); ESTAB=${ESTAB:-0}
   TW=$(awk '$1=="TIME-WAIT"{print $2}' "$TMP/ss_states"); TW=${TW:-0}
@@ -259,20 +274,14 @@ analyze() {
     FILENAME==ARGV[2]{cn[$1]=$2; ips[$1]=1; next}
     FILENAME==ARGV[3]{sr[$1]=$2; ips[$1]=1; next}
     END{ for (ip in ips){ pps=pk[ip]/secs; sc=pps+sy[ip]*5+cn[ip]*10+sr[ip]*20
-      sus=(pps>=ipp||sy[ip]>=isyn||cn[ip]>=icon||sr[ip]>=isr)?1:0
-      printf "%d %s %.0f %d %d %d %d\n", sc, ip, pps, sy[ip], cn[ip], sr[ip], sus } }' \
-    "$TMP/cap_src" "$TMP/conn_est" "$TMP/conn_syn" 2>/dev/null | sort -rn | head -n 400 > "$TMP/ranked"
-  ATT_ORDER=(); SUSPECTS=(); ATT_PPS=(); ATT_SYN=(); ATT_CONN=(); ATT_SR=(); ATT_SUS=()
-  local sc ip pps syn cn sr sus
-  while read -r sc ip pps syn cn sr sus; do
-    [ -z "$ip" ] && continue; is_protected "$ip" && continue
-    ATT_ORDER+=("$ip"); ATT_PPS[$ip]=$pps; ATT_SYN[$ip]=$syn; ATT_CONN[$ip]=$cn; ATT_SR[$ip]=$sr; ATT_SUS[$ip]=$sus
-    [ "$sus" -eq 1 ] && SUSPECTS+=("$ip")
-  done < "$TMP/ranked"
+      sus=(pps>=ipp||sy[ip]/secs>=isyn||cn[ip]>=icon||sr[ip]>=isr)?1:0
+      printf "%d %d %s %.0f %d %d %d\n", sus, sc, ip, pps, sy[ip], cn[ip], sr[ip] } }' \
+    "$TMP/cap_src" "$TMP/conn_est" "$TMP/conn_syn" 2>/dev/null | sort -k1,1nr -k2,2nr | head -n 400 > "$TMP/ranked"
+  load_ranked "$TMP/ranked"
   UNIQ_SRC=$(wc -l < "$TMP/cap_src" 2>/dev/null || echo 0)
  
   # verdict
-  SCORE=0; REASONS=(); ATTACK_TYPES=()
+  SCORE=0; REASONS=(); ATTACK_TYPES=(); SPOOFED=0
   local m=$(( RX_PPS / PPS_BASE ))
   if   [ "$m" -ge 7 ]; then SCORE=$((SCORE+3)); elif [ "$m" -ge 3 ]; then SCORE=$((SCORE+2)); elif [ "$m" -ge 1 ]; then SCORE=$((SCORE+1)); fi
   if   [ "$LINK_PCT" -ge 70 ]; then SCORE=$((SCORE+3)); elif [ "$LINK_PCT" -ge 40 ]; then SCORE=$((SCORE+2)); elif [ "$LINK_PCT" -ge 20 ]; then SCORE=$((SCORE+1)); fi
@@ -294,8 +303,10 @@ analyze() {
   if [ "$top_conn" -ge "$IP_CONNS" ]; then ATTACK_TYPES+=("Connection flood"); REASONS+=("CONNECTION FLOOD|one IP holds ${top_conn} concurrent connections"); fi
   [ "$LINK_PCT" -ge 70 ] && { ATTACK_TYPES+=("Volumetric"); REASONS+=("VOLUMETRIC|inbound ${RX_MBPS} Mbps = ${LINK_PCT}% of the ${LINK_MBPS} Mbps link"); }
   [ "$CT_PCT" -ge 85 ] && { ATTACK_TYPES+=("Conntrack exhaustion"); REASONS+=("CONNTRACK|connection-tracking table ${CT_PCT}% full — new connections will be dropped"); }
-  [ "$UNIQ_SRC" -ge 3000 ] && REASONS+=("SPOOFED/BOTNET|${UNIQ_SRC} unique source IPs in ${SECS}s — source addresses are likely spoofed or a large botnet")
+  [ "$UNIQ_SRC" -ge 3000 ] && SPOOFED=1; REASONS+=("SPOOFED/BOTNET|$(fmt "$UNIQ_SRC") unique sources — spoofed IPs or botnet")
   if [ "$SCORE" -ge 6 ]; then LEVEL=2; elif [ "$SCORE" -ge 3 ]; then LEVEL=1; else LEVEL=0; fi
+  # no attack: show plain top talkers by packet rate instead of "suspect first"
+  if [ "$LEVEL" -eq 0 ]; then sort -k4,4nr "$TMP/ranked" > "$TMP/ranked2"; load_ranked "$TMP/ranked2"; fi
 }
  
 # ----------------------------------------------------------------- rendering ----
@@ -310,7 +321,7 @@ build_port_map() { PORT2SRV=(); [ "$HAVE_DOCKER" -eq 1 ] || return
   while IFS='|' read -r name ports; do
     [[ "$name" =~ $UUID_RE ]] || continue
     lbl=$(grep -m1 '^motd=' "$VOL_ROOT/$name/server.properties" 2>/dev/null | cut -d= -f2- | sed -E 's/§.//g; s/\\u00[aA]7.//g; s/&[0-9a-fk-or]//g')
-    for p in $(grep -oE ':[0-9]+->' <<< "$ports" | tr -cd '0-9\n' | sort -u); do PORT2SRV[$p]="${name:0:8} ${lbl:0:22}"; done
+    for p in $(grep -oE ':[0-9]+->' <<< "$ports" | tr -cd '0-9\n' | sort -u); do PORT2SRV[$p]="${name:0:8} ${lbl:0:20}"; done
   done < <(docker ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null)
 }
 svc_name() { case "$1" in 25565) echo "Minecraft";; 19132) echo "Bedrock";; 30120) echo "FiveM";; 27015) echo "Source";; 80) echo "HTTP";; 443) echo "HTTPS";; 8080) echo "Wings API";; 2022) echo "Wings SFTP";; 22) echo SSH;; *) echo "";; esac; }
@@ -332,9 +343,11 @@ render() {
   box_bot; echo
   # ---- attackers
   local n=0 ip tag
-  geo_load; geo_lookup "${ATT_ORDER[@]:0:100}"
+  geo_load; geo_lookup "${SUSPECTS[@]:0:100}" "${ATT_ORDER[@]:0:100}"
   box_top
-  box_row "${RED}${B}TOP ATTACKING IPs${R}   ${GRY}${#SUSPECTS[@]} suspect IP(s) • red = over threshold${R}"
+  if [ "$LEVEL" -ge 1 ] && [ ${#SUSPECTS[@]} -gt 0 ]; then box_row "${RED}${B}TOP ATTACKING IPs${R}   ${GRY}${#SUSPECTS[@]} suspect IP(s) • red = over threshold${R}"
+  elif [ "$LEVEL" -ge 1 ]; then box_row "${YLW}${B}TOP SOURCES${R}   ${GRY}no single IP stands out — distributed / spoofed attack${R}"
+  else box_row "${CYN}${B}TOP TALKERS${R}   ${GRY}no attack detected — normal visitors & scans${R}"; fi
   box_sep
   box_row "${GRY}$(printf '%-3s %-16s %7s %5s %-5s %-10s %-19s' '#' 'IP ADDRESS' 'PPS' 'CONN' 'LOC' 'CITY' 'ISP / NETWORK')${R}"
   if [ ${#ATT_ORDER[@]} -eq 0 ]; then box_row "${GRN}No external sources stand out.${R}"; fi
@@ -346,10 +359,12 @@ render() {
   box_bot; echo
   # ---- countries
   declare -A CN_N CN_P CN_NAME; local cc
-  for ip in "${SUSPECTS[@]:0:100}"; do geo_row "$ip"; cc=$G_CC; CN_N[$cc]=$(( ${CN_N[$cc]:-0}+1 )); CN_P[$cc]=$(( ${CN_P[$cc]:-0}+${ATT_PPS[$ip]} )); CN_NAME[$cc]=$G_CO; done
+  local SRC_LIST=("${ATT_ORDER[@]:0:40}"); local ORIGIN_TITLE="TRAFFIC ORIGIN BY COUNTRY"
+  if [ "$LEVEL" -ge 1 ] && [ ${#SUSPECTS[@]} -gt 0 ]; then SRC_LIST=("${SUSPECTS[@]:0:100}"); ORIGIN_TITLE="ATTACK ORIGIN BY COUNTRY"; fi
+  for ip in "${SRC_LIST[@]}"; do geo_row "$ip"; cc=$G_CC; CN_N[$cc]=$(( ${CN_N[$cc]:-0}+1 )); CN_P[$cc]=$(( ${CN_P[$cc]:-0}+${ATT_PPS[$ip]} )); CN_NAME[$cc]=$G_CO; done
   if [ ${#CN_N[@]} -gt 0 ]; then
     local tot=0 k; for k in "${!CN_P[@]}"; do tot=$((tot+${CN_P[$k]})); done; [ "$tot" -eq 0 ] && tot=1
-    box_top; box_row "${ORG}${B}ATTACK ORIGIN BY COUNTRY${R}"; box_sep
+    box_top; box_row "${ORG}${B}${ORIGIN_TITLE}${R}"; box_sep
     COUNTRY_LIST=(); local i=0
     while read -r pp k; do
       i=$((i+1)); [ "$i" -gt 6 ] && break; COUNTRY_LIST+=("$k")
@@ -365,18 +380,27 @@ render() {
     any=1; srv="${PORT2SRV[$port]:-$(svc_name "$port")}"
     box_row "${GRY}port${R} ${B}$(printf '%-6s' "$port")${R}${GRY}$(printf '%-4s' "$proto")${R} $(printf '%9s' "$(fmt $((pk/${ELAP_INT:-1})))") pps  ${CYN}${srv}${R}"
     TOP_PORT=${TOP_PORT:-$port}
-  done < <(awk '{p[$1]+=$3; pr[$1]=$2} END{for(k in p) print k, pr[k], p[k]}' "$TMP/cap_dst" | sort -k3 -rn | head -5)
+  done < <(awk '$2=="tcp"||$2=="udp"{p[$1]+=$3; pr[$1]=$2} END{for(k in p) print k, pr[k], p[k]}' "$TMP/cap_dst" | sort -k3 -rn | head -5)
   [ $any -eq 0 ] && box_row "${GRY}no TCP/UDP destination data captured${R}"
   local dip dpk; while read -r dip dpk; do box_row "${GRY}dest IP${R} ${B}$(printf '%-18s' "$dip")${R} $(printf '%9s' "$(fmt $((dpk/${ELAP_INT:-1})))") pps"
-  done < <(sort -k2 -rn "$TMP/cap_dstip" | head -3)
-  if [ "$HAVE_DOCKER" -eq 1 ] && [ -s "$TMP/io1" ]; then
-    box_sep; box_row "${GRY}Inbound per game-server container:${R}"
-    local io_t; read -r io_t < "$TMP/io_elapsed"; local mx=0 rows
-    rows=$(awk -v t="$io_t" 'FNR==NR{a[$1]=$2;next} ($1 in a){d=$2-a[$1]; if(d<0)d=0; printf "%s %.2f\n",$1,d*8/1e6/t}' "$TMP/io0" "$TMP/io1" | grep -E '^[0-9a-f]{8}-' | sort -k2 -rn | head -4)
-    local nm mb; while read -r nm mb; do [ -z "$nm" ] && continue; [ "$mx" = 0 ] && mx=$(awk -v m="$mb" 'BEGIN{printf "%d", (m>0.01)?m:1}')
-      box_row "${B}${nm:0:8}${R} ${GRY}$(printf '%-24s' "${PORT2SRV_BY_NAME[$nm]:-}")${R}$(printf '%7s' "$mb") Mbps $(gauge "$(awk -v m="$mb" -v x="$mx" 'BEGIN{printf "%d", m*100/x}')" 10)"; done <<< "$rows"
+  done < <(grep -vE '^(255\.|22[4-9]\.|23[0-9]\.|ff[0-9a-f]{2}:|0\.)' "$TMP/cap_dstip" | sort -k2 -rn | head -3)
+  if [ ${#PORT2SRV[@]} -gt 0 ]; then
+    declare -A SRV_PK=(); local pp key
+    while read -r port pp; do key="${PORT2SRV[$port]:-}"; [ -z "$key" ] && continue; SRV_PK[$key]=$(( ${SRV_PK[$key]:-0} + pp )); done \
+      < <(awk '$2=="tcp"||$2=="udp"{print $1, $3}' "$TMP/cap_dst")
+    if [ ${#SRV_PK[@]} -gt 0 ]; then
+      box_sep; box_row "${GRY}Inbound per game server (from captured packets):${R}"
+      local mx=0 spps share lbl8 rest ct=$CAP_TOT; [ "$ct" -lt 1 ] && ct=1
+      while read -r pp key; do [ -z "$key" ] && continue; [ "$mx" -eq 0 ] && mx=$pp; spps=$((pp/${ELAP_INT:-1})); share=$((pp*100/ct))
+        lbl8=${key%% *}; rest=${key#* }; [ "$rest" = "$key" ] && rest=""
+        box_row "${B}${lbl8}${R} ${GRY}$(printf '%-21s' "${rest:0:21}")${R}$(printf '%8s' "$(fmt "$spps")") pps $(gauge $((pp*100/mx)) 10) ${GRY}${share}% of traffic${R}"
+      done < <(for key in "${!SRV_PK[@]}"; do echo "${SRV_PK[$key]} $key"; done | sort -rn | head -4)
+    fi
   fi
   box_bot
+  if [ "$SPOOFED" -eq 1 ]; then
+    echo; printf '  %s▲ Source addresses look spoofed/botnet.%s Blocking single IPs will not stop this —\n    use [4] rate limits, [6] kernel hardening, and ask your provider for upstream filtering.\n' "$YLW$B" "$R"
+  fi
   if [ "$LINK_PCT" -ge 70 ]; then
     echo; printf '  %s▲ Traffic is saturating your link.%s Filtering on this node cannot fix a saturated uplink —\n    ask your provider for upstream DDoS mitigation / a null-route of the attacked IP,\n    or put game ports behind a DDoS-protected proxy/tunnel.\n' "$YLW$B" "$R"
   fi
@@ -426,7 +450,7 @@ do_block_custom() {
   read -rp "  ${CYN}IP(s) or CIDR(s) to block (space separated): ${R}" list; ensure_fw || return
   local t; for t in $list; do
     [[ "$t" =~ ^[0-9a-fA-F:.]+(/[0-9]{1,3})?$ ]] || { printf '  %s✖ invalid: %s%s\n' "$RED" "$t" "$R"; continue; }
-    is_protected "${t%%/*}" && { printf '  %s✖ %s is protected (private/admin/own IP) — skipped%s\n' "$RED" "$t" "$R"; continue; }
+    is_protected "${t%%/*}" && { printf '  %s✖ %s is protected (private / admin / DNS resolver / own IP) — skipped%s\n' "$RED" "$t" "$R"; continue; }
     block_ip "$t" && printf '  %s✔ blocked %s%s\n' "$GRN" "$t" "$R"
   done
 }
@@ -543,6 +567,7 @@ actions_menu() {
   local ch yn
   while true; do
     echo
+    [ "$LEVEL" -eq 0 ] && printf '  %sNo attack detected — everything below is optional.%s\n' "$GRN" "$R"
     printf '  %sMitigation:%s  %s(suspects: %d • blocks last %sh • admin/panel/private IPs are never blocked)%s\n' "$B" "$R" "$GRY" "${#SUSPECTS[@]}" "$((BLOCK_TTL/3600))" "$R"
     printf '    %s[1]%s %sBlock all suspect IPs%s\n' "$B" "$R" "$RED" "$R"
     printf '    %s[2]%s %sBlock specific IP / CIDR%s\n' "$B" "$R" "$YLW" "$R"
@@ -584,7 +609,7 @@ main() {
   [ "$(id -u)" -eq 0 ] || { printf '%s✖ Run as root (sudo -i).%s\n' "$RED" "$R"; exit 1; }
   mkdir -p "$STATE_DIR" 2>/dev/null
   if [ "${1:-scan}" = "flush" ]; then do_flush_all; exit 0; fi
-  ensure_pkg tcpdump tcpdump || [ -n "${LUMA_FAKE_CAPTURE:-}" ] || { printf '%s✖ tcpdump is required.%s\n' "$RED" "$R"; exit 1; }
+  [ -n "${LUMA_FAKE_CAPTURE:-}" ] || ensure_pkg tcpdump tcpdump || { printf '%s✖ tcpdump is required.%s\n' "$RED" "$R"; exit 1; }
   ensure_pkg ss iproute2 >/dev/null 2>&1; ensure_pkg jq jq >/dev/null 2>&1; ensure_pkg curl curl >/dev/null 2>&1
   detect_env; [ -z "$IFACE" ] && { printf '%s✖ Could not detect the network interface (set LUMA_IFACE).%s\n' "$RED" "$R"; exit 1; }
   build_whitelist
