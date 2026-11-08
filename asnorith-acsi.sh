@@ -105,9 +105,9 @@ printf "${CYAN}%-18s${RESET} %s\n" "IP:" "$IP"
 echo -e "${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 
 # ===== FOOTER =====
-echo -e "${GREEN}Support:${RESET}  support@asnorith.tech"
-echo -e "${GREEN}Discord:${RESET}  https://discord.gg/asnorith"
-echo -e "${GREEN}Website:${RESET}  https://asnorith.tech"
+echo -e "${GREEN}Support:${RESET}  support@asnorith.info"
+echo -e "${GREEN}Discord:${RESET}  https://discord.gg/PdYZunufY"
+echo -e "${GREEN}Website:${RESET}  https://asnorith.info"
 echo -e "${MAGENTA}Asnorith Technologies — Premium Hosting Experience 💎${RESET}"
 echo ""
 EOF
