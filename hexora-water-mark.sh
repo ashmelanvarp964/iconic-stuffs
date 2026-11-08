@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# Hexora Clouds Technologies Premium MOTD Installer (v1)
+# Hexora Clouds Technologies Premium MOTD Installer (v2)
 # FULL CLEAN + ONLY CUSTOM MOTD
 # ==========================================
 
@@ -13,15 +13,11 @@ echo "🔧 Installing Hexora Clouds Technologies Premium MOTD..."
 # ================================
 echo "🧹 Removing old MOTD completely..."
 
-# Disable all default MOTD scripts
 chmod -x /etc/update-motd.d/* 2>/dev/null || true
-
-# Remove default files
 rm -f /etc/motd
 rm -f /var/run/motd
 rm -f /run/motd.dynamic
 
-# Disable motd-news
 if [ -f /etc/default/motd-news ]; then
     sed -i 's/ENABLED=1/ENABLED=0/g' /etc/default/motd-news
 fi
@@ -31,15 +27,12 @@ fi
 # ================================
 echo "⚙ Configuring PAM..."
 
-# Backup PAM files (safe)
 cp /etc/pam.d/sshd /etc/pam.d/sshd.bak 2>/dev/null || true
 cp /etc/pam.d/login /etc/pam.d/login.bak 2>/dev/null || true
 
-# Remove old motd lines
 sed -i '/pam_motd.so/d' /etc/pam.d/sshd
 sed -i '/pam_motd.so/d' /etc/pam.d/login
 
-# Add ONLY our MOTD
 echo "session optional pam_exec.so stdout /etc/update-motd.d/00-hexoraclouds" >> /etc/pam.d/sshd
 echo "session optional pam_exec.so stdout /etc/update-motd.d/00-hexoraclouds" >> /etc/pam.d/login
 
@@ -60,7 +53,7 @@ YELLOW="\e[38;5;220m"
 GRAY="\e[38;5;245m"
 RESET="\e[0m"
 
-# ===== System Info (Optimized) =====
+# ===== System Info =====
 HOSTNAME=$(hostname)
 OS=$(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')
 KERNEL=$(uname -r)
@@ -82,13 +75,13 @@ echo ""
 # ===== LOGO =====
 echo -e "${CYAN}"
 cat << "LOGO"
-██  ██ ██████ ██  ██  ████  █████   ████   ████  ██      ████  ██  ██ █████  ██████
-██  ██ ██      ██ ██ ██  ██ ██  ██ ██  ██ ██  ██ ██     ██  ██ ██  ██ ██  ██ ██
-██████ ██       ████ ██  ██ ██  ██ ██  ██ ██     ██     ██  ██ ██  ██ ██  ██ ██
-██  ██ █████    ████ ██  ██ █████  ██████ ██     ██     ██  ██ ██  ██ ██  ██ █████
-██  ██ ██      ██ ██ ██  ██ ██ ██  ██  ██ ██     ██     ██  ██ ██  ██ ██  ██     ██
-██  ██ ██     ██  ██ ██  ██ ██  ██ ██  ██ ██  ██ ██     ██  ██ ██  ██ ██  ██     ██
-██  ██ ██████ ██  ██  ████  ██  ██ ██  ██  ████  ██████  ████   ████  █████  ██████
+██   ██  ███████  ██   ██   █████   ██████    █████    █████   ██        █████   ██   ██  ██████   ███████
+██   ██  ██        ██ ██   ██   ██  ██   ██  ██   ██  ██   ██  ██       ██   ██  ██   ██  ██   ██  ██
+███████  ██         ███    ██   ██  ██   ██  ██   ██  ██       ██       ██   ██  ██   ██  ██   ██  ██
+██   ██  ██████     ███    ██   ██  ██████   ███████  ██       ██       ██   ██  ██   ██  ██   ██  ███████
+██   ██  ██        ██ ██   ██   ██  ██ ██    ██   ██  ██       ██       ██   ██  ██   ██  ██   ██       ██
+██   ██  ██       ██   ██  ██   ██  ██  ██   ██   ██  ██   ██  ██       ██   ██  ██   ██  ██   ██       ██
+██   ██  ███████  ██   ██   █████   ██   ██  ██   ██   █████   ███████   █████    █████   ██████   ███████
 LOGO
 echo -e "${RESET}"
 
@@ -121,9 +114,6 @@ EOF
 
 chmod +x /etc/update-motd.d/00-hexoraclouds
 
-# ================================
-# RESTART SERVICES
-# ================================
 systemctl restart ssh 2>/dev/null || true
 
 echo ""
